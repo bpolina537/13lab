@@ -13,79 +13,60 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// BookingRequest — входящий запрос на бронирование
+type TaskEnvelope struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+}
+
 type BookingRequest struct {
 	PlaceID   string `json:"place_id"`
 	CarNumber string `json:"car_number"`
 	Hours     int    `json:"hours"`
 }
 
-// BookingRecord — запись о бронировании в хранилище
-type BookingRecord struct {
-	BookingID string    `json:"booking_id"`
-	PlaceID   string    `json:"place_id"`
-	CarNumber string    `json:"car_number"`
-	Hours     int       `json:"hours"`
-	CreatedAt time.Time `json:"created_at"`
-}
-
-// BookingResult — результат бронирования
+// В BookingResult НЕТ task_id
 type BookingResult struct {
 	BookingID string `json:"booking_id"`
 	Success   bool   `json:"success"`
 	Message   string `json:"message,omitempty"`
 }
 
-// CompletedEvent — публикуется в tasks.completed после обработки
 type CompletedEvent struct {
+	TaskID  string      `json:"task_id"`   // <-- task_id ТОЛЬКО ЗДЕСЬ
 	Agent   string      `json:"agent"`
 	Subject string      `json:"subject"`
 	Result  interface{} `json:"result"`
 }
 
-// BookingStore — потокобезопасное хранилище броней
 type BookingStore struct {
 	mu       sync.RWMutex
-	bookings map[string]*BookingRecord // booking_id -> запись
-	places   map[string]string         // place_id -> booking_id (занятые места)
+	bookings map[string]interface{}
+	places   map[string]string
 }
 
 func NewBookingStore() *BookingStore {
 	return &BookingStore{
-		bookings: make(map[string]*BookingRecord),
+		bookings: make(map[string]interface{}),
 		places:   make(map[string]string),
 	}
 }
 
-// Book — атомарно проверяет и бронирует место
-func (s *BookingStore) Book(placeID, carNumber string, hours int) (string, error, bool) {
+func (s *BookingStore) Book(placeID, carNumber string, hours int) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if _, occupied := s.places[placeID]; occupied {
-		return "", nil, false
+		return "", false
 	}
-
 	bookingID := uuid.New().String()
-	record := &BookingRecord{
-		BookingID: bookingID,
-		PlaceID:   placeID,
-		CarNumber: carNumber,
-		Hours:     hours,
-		CreatedAt: time.Now(),
-	}
-	s.bookings[bookingID] = record
+	s.bookings[bookingID] = struct {
+		PlaceID   string
+		CarNumber string
+		Hours     int
+		Time      time.Time
+	}{placeID, carNumber, hours, time.Now()}
 	s.places[placeID] = bookingID
-
-	return bookingID, nil, true
-}
-
-// Get — получить запись по ID брони (для других агентов, если нужно расширить)
-func (s *BookingStore) Get(bookingID string) (*BookingRecord, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	rec, ok := s.bookings[bookingID]
-	return rec, ok
+	return bookingID, true
 }
 
 func main() {
@@ -96,17 +77,9 @@ func main() {
 		natsURL = nats.DefaultURL
 	}
 
-	nc, err := nats.Connect(natsURL,
-		nats.Name("parking-booking-agent"),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			logger.Printf("Отключён от NATS: %v", err)
-		}),
-		nats.ReconnectHandler(func(_ *nats.Conn) {
-			logger.Println("Переподключён к NATS")
-		}),
-	)
+	nc, err := nats.Connect(natsURL)
 	if err != nil {
-		logger.Fatalf("Ошибка подключения к NATS: %v", err)
+		logger.Fatalf("Ошибка: %v", err)
 	}
 	defer nc.Drain()
 
@@ -115,66 +88,56 @@ func main() {
 	store := NewBookingStore()
 
 	sub, err := nc.Subscribe("parking.book", func(msg *nats.Msg) {
-		logger.Printf("Получено сообщение на канале %s: %s", msg.Subject, string(msg.Data))
+		logger.Printf("Получено: %s", string(msg.Data))
+
+		var envelope TaskEnvelope
+		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+			logger.Printf("Ошибка парсинга конверта: %v", err)
+			return
+		}
 
 		var req BookingRequest
-		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			logger.Printf("Ошибка парсинга запроса: %v", err)
+		if err := json.Unmarshal([]byte(envelope.Payload), &req); err != nil {
+			logger.Printf("Ошибка парсинга payload: %v", err)
 			return
 		}
 
-		if req.PlaceID == "" || req.CarNumber == "" || req.Hours <= 0 {
-			logger.Printf("Ошибка: невалидные данные запроса: %+v", req)
-			return
-		}
-
-		bookingID, _, success := store.Book(req.PlaceID, req.CarNumber, req.Hours)
+		bookingID, success := store.Book(req.PlaceID, req.CarNumber, req.Hours)
 
 		var result BookingResult
 		if success {
 			result = BookingResult{
 				BookingID: bookingID,
 				Success:   true,
-				Message:   "Место успешно забронировано",
+				Message:   "Место забронировано",
 			}
-			logger.Printf("Бронирование успешно: booking_id=%s, место=%s, авто=%s, часов=%d",
-				bookingID, req.PlaceID, req.CarNumber, req.Hours)
+			logger.Printf("Бронирование успешно: %s", bookingID)
 		} else {
 			result = BookingResult{
-				BookingID: "",
-				Success:   false,
-				Message:   "Место уже занято",
+				Success: false,
+				Message: "Место уже занято",
 			}
-			logger.Printf("Бронирование отклонено: место %s уже занято", req.PlaceID)
+			logger.Printf("Бронирование отклонено: место %s занято", req.PlaceID)
 		}
 
 		event := CompletedEvent{
+			TaskID:  envelope.ID,
 			Agent:   "booking",
 			Subject: msg.Subject,
 			Result:  result,
 		}
-		payload, err := json.Marshal(event)
-		if err != nil {
-			logger.Printf("Ошибка сериализации результата: %v", err)
-			return
-		}
-
-		if err := nc.Publish("tasks.completed", payload); err != nil {
-			logger.Printf("Ошибка публикации в tasks.completed: %v", err)
-			return
-		}
-		logger.Printf("Результат опубликован в tasks.completed: %s", string(payload))
+		payload, _ := json.Marshal(event)
+		nc.Publish("tasks.completed", payload)
+		logger.Printf("Ответ отправлен (task_id=%s)", envelope.ID)
 	})
 	if err != nil {
-		logger.Fatalf("Ошибка подписки на parking.book: %v", err)
+		logger.Fatalf("Ошибка подписки: %v", err)
 	}
 	defer sub.Unsubscribe()
 
-	logger.Println("Агент запущен, ожидание сообщений на канале parking.book...")
-
+	logger.Println("Агент бронирования запущен")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
-	logger.Println("Завершение работы агента бронирования")
+	logger.Println("Завершение")
 }

@@ -11,20 +11,18 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// AccessRequest — входящий запрос на контроль доступа
+type TaskEnvelope struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+}
+
 type AccessRequest struct {
 	BookingID string `json:"booking_id"`
 	CarNumber string `json:"car_number"`
-	Action    string `json:"action"` // "enter" или "exit"
+	Action    string `json:"action"`
 }
 
-// BookingInfo — минимальные данные брони, известные агенту доступа
-type BookingInfo struct {
-	CarNumber string
-	IsInside  bool
-}
-
-// AccessResult — результат проверки доступа
 type AccessResult struct {
 	Success   bool   `json:"success"`
 	Message   string `json:"message"`
@@ -32,65 +30,65 @@ type AccessResult struct {
 	BookingID string `json:"booking_id"`
 }
 
-// CompletedEvent — публикуется в tasks.completed после обработки
 type CompletedEvent struct {
+	TaskID  string      `json:"task_id"`
 	Agent   string      `json:"agent"`
 	Subject string      `json:"subject"`
 	Result  interface{} `json:"result"`
 }
 
-// AccessStore — потокобезопасное хранилище данных доступа
-// В реальной системе агент получал бы данные от агента бронирования через NATS.
-// Здесь — встроенный реестр с методом регистрации брони.
 type AccessStore struct {
 	mu       sync.RWMutex
-	bookings map[string]*BookingInfo // booking_id -> info
+	bookings map[string]struct {
+		CarNumber string
+		IsInside  bool
+	}
 }
 
 func NewAccessStore() *AccessStore {
 	return &AccessStore{
-		bookings: make(map[string]*BookingInfo),
+		bookings: make(map[string]struct {
+			CarNumber string
+			IsInside  bool
+		}),
 	}
 }
 
-// Register — зарегистрировать бронь (вызывается при получении события от агента бронирования)
-func (s *AccessStore) Register(bookingID, carNumber string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.bookings[bookingID] = &BookingInfo{
-		CarNumber: carNumber,
-		IsInside:  false,
-	}
-}
-
-// CheckAccess — проверить доступ и обновить статус
 func (s *AccessStore) CheckAccess(bookingID, carNumber, action string) (bool, string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	info, ok := s.bookings[bookingID]
 	if !ok {
-		return false, "Бронирование не найдено"
+		// Авторегистрация при первом запросе
+		s.bookings[bookingID] = struct {
+			CarNumber string
+			IsInside  bool
+		}{carNumber, false}
+		info = s.bookings[bookingID]
 	}
+
 	if info.CarNumber != carNumber {
-		return false, "Номер автомобиля не совпадает с бронированием"
+		return false, "Номер автомобиля не совпадает"
 	}
 
 	switch action {
 	case "enter":
 		if info.IsInside {
-			return false, "Автомобиль уже находится на парковке"
+			return false, "Автомобиль уже на парковке"
 		}
 		info.IsInside = true
-		return true, "Шлагбаум открыт — въезд разрешён"
+		s.bookings[bookingID] = info
+		return true, "Въезд разрешён"
 	case "exit":
 		if !info.IsInside {
-			return false, "Автомобиль не зарегистрирован как въехавший"
+			return false, "Автомобиль не на парковке"
 		}
 		info.IsInside = false
-		return true, "Шлагбаум открыт — выезд разрешён"
+		s.bookings[bookingID] = info
+		return true, "Выезд разрешён"
 	default:
-		return false, "Неизвестное действие: допустимы 'enter' или 'exit'"
+		return false, "Неизвестное действие"
 	}
 }
 
@@ -102,17 +100,9 @@ func main() {
 		natsURL = nats.DefaultURL
 	}
 
-	nc, err := nats.Connect(natsURL,
-		nats.Name("parking-access-agent"),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			logger.Printf("Отключён от NATS: %v", err)
-		}),
-		nats.ReconnectHandler(func(_ *nats.Conn) {
-			logger.Println("Переподключён к NATS")
-		}),
-	)
+	nc, err := nats.Connect(natsURL)
 	if err != nil {
-		logger.Fatalf("Ошибка подключения к NATS: %v", err)
+		logger.Fatalf("Ошибка подключения: %v", err)
 	}
 	defer nc.Drain()
 
@@ -120,56 +110,24 @@ func main() {
 
 	store := NewAccessStore()
 
-	// Слушаем tasks.completed чтобы получать подтверждённые брони от агента бронирования
-	_, err = nc.Subscribe("tasks.completed", func(msg *nats.Msg) {
-		var event struct {
-			Agent  string `json:"agent"`
-			Result struct {
-				BookingID string `json:"booking_id"`
-				Success   bool   `json:"success"`
-				// CarNumber недоступен напрямую в результате — нужно хранить при запросе
-				// В production: использовать request-reply или общее хранилище
-			} `json:"result"`
-		}
-		if err := json.Unmarshal(msg.Data, &event); err != nil {
-			return
-		}
-		// Регистрируем только успешные брони от агента бронирования
-		// CarNumber будет получен из запроса на доступ при первом обращении
-		if event.Agent == "booking" && event.Result.Success && event.Result.BookingID != "" {
-			logger.Printf("Получено новое бронирование: %s — ожидаем запрос на доступ", event.Result.BookingID)
-		}
-	})
-	if err != nil {
-		logger.Fatalf("Ошибка подписки на tasks.completed: %v", err)
-	}
-
-	// Основная подписка на канал доступа
 	sub, err := nc.Subscribe("parking.access", func(msg *nats.Msg) {
-		logger.Printf("Получено сообщение на канале %s: %s", msg.Subject, string(msg.Data))
+		logger.Printf("Получено сообщение: %s", string(msg.Data))
 
+		// Парсим конверт от оркестратора
+		var envelope TaskEnvelope
+		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+			logger.Printf("Ошибка парсинга конверта: %v", err)
+			return
+		}
+
+		// Парсим payload
 		var req AccessRequest
-		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			logger.Printf("Ошибка парсинга запроса: %v", err)
+		if err := json.Unmarshal([]byte(envelope.Payload), &req); err != nil {
+			logger.Printf("Ошибка парсинга payload: %v", err)
 			return
 		}
 
-		if req.BookingID == "" || req.CarNumber == "" || req.Action == "" {
-			logger.Printf("Ошибка: невалидные данные запроса: %+v", req)
-			return
-		}
-
-		// Авторегистрация: если booking_id ещё не известен агенту —
-		// регистрируем при первом обращении (упрощение без общего хранилища)
-		store.mu.Lock()
-		if _, exists := store.bookings[req.BookingID]; !exists {
-			store.bookings[req.BookingID] = &BookingInfo{
-				CarNumber: req.CarNumber,
-				IsInside:  false,
-			}
-			logger.Printf("Автоматически зарегистрирована бронь %s для авто %s", req.BookingID, req.CarNumber)
-		}
-		store.mu.Unlock()
+		logger.Printf("Запрос: booking_id=%s, car=%s, action=%s", req.BookingID, req.CarNumber, req.Action)
 
 		success, message := store.CheckAccess(req.BookingID, req.CarNumber, req.Action)
 
@@ -181,40 +139,30 @@ func main() {
 		}
 
 		if success {
-			logger.Printf("Доступ разрешён: booking_id=%s, авто=%s, действие=%s",
-				req.BookingID, req.CarNumber, req.Action)
+			logger.Printf("✅ Доступ разрешён: %s", message)
 		} else {
-			logger.Printf("Доступ отклонён: booking_id=%s, авто=%s, действие=%s, причина=%s",
-				req.BookingID, req.CarNumber, req.Action, message)
+			logger.Printf("❌ Доступ отклонён: %s", message)
 		}
 
 		event := CompletedEvent{
+			TaskID:  envelope.ID,
 			Agent:   "access",
 			Subject: msg.Subject,
 			Result:  result,
 		}
-		payload, err := json.Marshal(event)
-		if err != nil {
-			logger.Printf("Ошибка сериализации результата: %v", err)
-			return
-		}
-
-		if err := nc.Publish("tasks.completed", payload); err != nil {
-			logger.Printf("Ошибка публикации в tasks.completed: %v", err)
-			return
-		}
-		logger.Printf("Результат опубликован в tasks.completed: %s", string(payload))
+		payload, _ := json.Marshal(event)
+		nc.Publish("tasks.completed", payload)
+		logger.Printf("Ответ отправлен (task_id=%s)", envelope.ID)
 	})
 	if err != nil {
-		logger.Fatalf("Ошибка подписки на parking.access: %v", err)
+		logger.Fatalf("Ошибка подписки: %v", err)
 	}
 	defer sub.Unsubscribe()
 
-	logger.Println("Агент запущен, ожидание сообщений на канале parking.access...")
+	logger.Println("Агент доступа запущен, ожидание сообщений...")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
-	logger.Println("Завершение работы агента контроля доступа")
+	logger.Println("Завершение работы")
 }

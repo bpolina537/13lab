@@ -10,25 +10,31 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// SearchRequest — входящий запрос на поиск мест
+// ЭТИ СТРУКТУРЫ ДОЛЖНЫ ПОЛНОСТЬЮ СООТВЕТСТВОВАТЬ ТОМУ, ЧТО ШЛЕТ ОРКЕСТРАТОР
+type TaskEnvelope struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Payload string `json:"payload"`
+}
+
 type SearchRequest struct {
 	Zone string `json:"zone"`
 }
 
-// SearchResult — результат поиска мест
+// ЭТОТ РЕЗУЛЬТАТ УВИДИТ ОРКЕСТРАТОР
 type SearchResult struct {
 	Zone   string   `json:"zone"`
 	Places []string `json:"places"`
 }
 
-// CompletedEvent — публикуется в tasks.completed после обработки
+// ЭТО СОБЫТИЕ, КОТОРОЕ ОРКЕСТРАТОР ЖДЕТ В КАНАЛЕ tasks.completed
 type CompletedEvent struct {
+    TaskID  string      `json:"task_id"`
 	Agent   string      `json:"agent"`
 	Subject string      `json:"subject"`
 	Result  interface{} `json:"result"`
 }
 
-// zoneMap — фиксированный список мест по зонам
 var zoneMap = map[string][]string{
 	"A": {"A1", "A2", "A3"},
 	"B": {"B1", "B2"},
@@ -43,15 +49,7 @@ func main() {
 		natsURL = nats.DefaultURL
 	}
 
-	nc, err := nats.Connect(natsURL,
-		nats.Name("parking-search-agent"),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			logger.Printf("Отключён от NATS: %v", err)
-		}),
-		nats.ReconnectHandler(func(_ *nats.Conn) {
-			logger.Println("Переподключён к NATS")
-		}),
-	)
+	nc, err := nats.Connect(natsURL)
 	if err != nil {
 		logger.Fatalf("Ошибка подключения к NATS: %v", err)
 	}
@@ -60,58 +58,56 @@ func main() {
 	logger.Printf("Подключён к NATS: %s", natsURL)
 
 	sub, err := nc.Subscribe("parking.search", func(msg *nats.Msg) {
-		logger.Printf("Получено сообщение на канале %s: %s", msg.Subject, string(msg.Data))
+		// 1. ПРИНИМАЕМ КОНВЕРТ ОТ ОРКЕСТРАТОРА
+		var envelope TaskEnvelope
+		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+			logger.Printf("Ошибка парсинга конверта: %v. Данные: %s", err, string(msg.Data))
+			return
+		}
+		logger.Printf("Получен конверт: ID=%s, Type=%s", envelope.ID, envelope.Type)
 
+		// 2. ДОСТАЕМ РЕАЛЬНЫЙ ЗАПРОС ИЗ PAYLOAD
 		var req SearchRequest
-		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			logger.Printf("Ошибка парсинга запроса: %v", err)
+		if err := json.Unmarshal([]byte(envelope.Payload), &req); err != nil {
+			logger.Printf("Ошибка парсинга payload: %v. Payload: %s", err, envelope.Payload)
 			return
 		}
+		logger.Printf("Поиск в зоне: %s", req.Zone)
 
-		if req.Zone == "" {
-			logger.Println("Ошибка: поле 'zone' не задано")
-			return
-		}
-
+		// 3. ФОРМИРУЕМ РЕЗУЛЬТАТ
 		places, ok := zoneMap[req.Zone]
 		if !ok {
-			logger.Printf("Зона '%s' не найдена", req.Zone)
 			places = []string{}
 		}
+		result := SearchResult{Zone: req.Zone, Places: places}
+		logger.Printf("Результат поиска: %v", places)
 
-		result := SearchResult{
-			Zone:   req.Zone,
-			Places: places,
-		}
-		logger.Printf("Найдено мест в зоне %s: %v", req.Zone, places)
-
+		// 4. ОТПРАВЛЯЕМ ОТВЕТ В ФОРМАТЕ, КОТОРЫЙ ЖДЕТ ОРКЕСТРАТОР
 		event := CompletedEvent{
+		    TaskID:  envelope.ID,
 			Agent:   "search",
 			Subject: msg.Subject,
 			Result:  result,
 		}
 		payload, err := json.Marshal(event)
 		if err != nil {
-			logger.Printf("Ошибка сериализации результата: %v", err)
+			logger.Printf("Ошибка сериализации ответа: %v", err)
 			return
 		}
-
 		if err := nc.Publish("tasks.completed", payload); err != nil {
-			logger.Printf("Ошибка публикации в tasks.completed: %v", err)
+			logger.Printf("Ошибка публикации ответа: %v", err)
 			return
 		}
-		logger.Printf("Результат опубликован в tasks.completed: %s", string(payload))
+		logger.Printf("Ответ отправлен в tasks.completed")
 	})
 	if err != nil {
-		logger.Fatalf("Ошибка подписки на parking.search: %v", err)
+		logger.Fatalf("Ошибка подписки: %v", err)
 	}
 	defer sub.Unsubscribe()
 
-	logger.Println("Агент запущен, ожидание сообщений на канале parking.search...")
-
+	logger.Println("Агент поиска запущен и ждет сообщения...")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-
-	logger.Println("Завершение работы агента поиска")
+	logger.Println("Завершение работы")
 }
