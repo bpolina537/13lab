@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -8,6 +9,14 @@ import (
 	"syscall"
 
 	"github.com/nats-io/nats.go"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type TaskEnvelope struct {
@@ -22,11 +31,11 @@ type PaymentRequest struct {
 }
 
 type PaymentResult struct {
-	BookingID  string  `json:"booking_id"`
-	Hours      int     `json:"hours"`
-	Amount     float64 `json:"amount"`
-	Currency   string  `json:"currency"`
-	Discount   bool    `json:"discount"`
+	BookingID string  `json:"booking_id"`
+	Hours     int     `json:"hours"`
+	Amount    float64 `json:"amount"`
+	Currency  string  `json:"currency"`
+	Discount  bool    `json:"discount"`
 }
 
 type CompletedEvent struct {
@@ -50,7 +59,32 @@ func calculateAmount(hours int) (float64, bool) {
 	return total, false
 }
 
+var tracer trace.Tracer
+
+func initTracer() func() {
+	exporter, _ := otlptracegrpc.New(
+		context.Background(),
+		otlptracegrpc.WithEndpoint("jaeger:4317"),
+		otlptracegrpc.WithInsecure(),
+	)
+
+	res, _ := resource.New(context.Background(),
+		resource.WithAttributes(semconv.ServiceNameKey.String("payment-agent")),
+	)
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	tracer = tp.Tracer("payment-agent")
+	return func() { _ = tp.Shutdown(context.Background()) }
+}
+
 func main() {
+	shutdown := initTracer()
+	defer shutdown()
+
 	logger := log.New(os.Stdout, "[PAYMENT-AGENT] ", log.LstdFlags|log.Lmsgprefix)
 
 	natsURL := os.Getenv("NATS_URL")
@@ -60,30 +94,35 @@ func main() {
 
 	nc, err := nats.Connect(natsURL)
 	if err != nil {
-		logger.Fatalf("Ошибка подключения: %v", err)
+		logger.Fatalf("Ошибка: %v", err)
 	}
 	defer nc.Drain()
 
 	logger.Printf("Подключён к NATS: %s", natsURL)
 
 	sub, err := nc.Subscribe("parking.payment", func(msg *nats.Msg) {
-		logger.Printf("Получено сообщение: %s", string(msg.Data))
+		ctx := context.Background()
 
-		// 1. Парсим конверт от оркестратора
 		var envelope TaskEnvelope
 		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
-			logger.Printf("Ошибка парсинга конверта: %v", err)
+			logger.Printf("Ошибка парсинга: %v", err)
 			return
 		}
 
-		// 2. Парсим payload (реальный запрос)
 		var req PaymentRequest
 		if err := json.Unmarshal([]byte(envelope.Payload), &req); err != nil {
-			logger.Printf("Ошибка парсинга payload: %v", err)
+			logger.Printf("Ошибка payload: %v", err)
 			return
 		}
 
-		logger.Printf("Запрос оплаты: booking_id=%s, hours=%d", req.BookingID, req.Hours)
+		ctx, span := tracer.Start(ctx, "payment.calculate",
+			trace.WithAttributes(
+				attribute.String("task.id", envelope.ID),
+				attribute.String("booking_id", req.BookingID),
+				attribute.Int("hours", req.Hours),
+			),
+		)
+		defer span.End()
 
 		amount, hasDiscount := calculateAmount(req.Hours)
 
@@ -95,13 +134,9 @@ func main() {
 			Discount:  hasDiscount,
 		}
 
-		if hasDiscount {
-			logger.Printf("✅ Сумма со скидкой: %.2f RUB (часов=%d)", amount, req.Hours)
-		} else {
-			logger.Printf("✅ Сумма без скидки: %.2f RUB (часов=%d)", amount, req.Hours)
-		}
+		logger.Printf("Сумма: %.2f RUB (скидка=%v)", amount, hasDiscount)
+		span.SetAttributes(attribute.Float64("amount", amount))
 
-		// 3. Отправляем ответ с task_id
 		event := CompletedEvent{
 			TaskID:  envelope.ID,
 			Agent:   "payment",
@@ -110,17 +145,15 @@ func main() {
 		}
 		payload, _ := json.Marshal(event)
 		nc.Publish("tasks.completed", payload)
-		logger.Printf("Ответ отправлен (task_id=%s)", envelope.ID)
 	})
 	if err != nil {
 		logger.Fatalf("Ошибка подписки: %v", err)
 	}
 	defer sub.Unsubscribe()
 
-	logger.Println("Агент оплаты запущен, ожидание сообщений...")
-
+	logger.Println("Агент оплаты запущен (с трассировкой)")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	logger.Println("Завершение работы")
+	logger.Println("Завершение")
 }

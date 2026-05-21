@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -11,6 +12,14 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
+
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type TaskEnvelope struct {
@@ -25,7 +34,6 @@ type BookingRequest struct {
 	Hours     int    `json:"hours"`
 }
 
-// В BookingResult НЕТ task_id
 type BookingResult struct {
 	BookingID string `json:"booking_id"`
 	Success   bool   `json:"success"`
@@ -33,7 +41,7 @@ type BookingResult struct {
 }
 
 type CompletedEvent struct {
-	TaskID  string      `json:"task_id"`   // <-- task_id ТОЛЬКО ЗДЕСЬ
+	TaskID  string      `json:"task_id"`
 	Agent   string      `json:"agent"`
 	Subject string      `json:"subject"`
 	Result  interface{} `json:"result"`
@@ -69,7 +77,35 @@ func (s *BookingStore) Book(placeID, carNumber string, hours int) (string, bool)
 	return bookingID, true
 }
 
+var tracer trace.Tracer
+
+func initTracer() func() {
+	exporter, err := otlptracegrpc.New(
+		context.Background(),
+		otlptracegrpc.WithEndpoint("jaeger:4317"),
+		otlptracegrpc.WithInsecure(),
+	)
+	if err != nil {
+		log.Fatalf("Ошибка exporter: %v", err)
+	}
+
+	res, _ := resource.New(context.Background(),
+		resource.WithAttributes(semconv.ServiceNameKey.String("booking-agent")),
+	)
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(tp)
+	tracer = tp.Tracer("booking-agent")
+	return func() { _ = tp.Shutdown(context.Background()) }
+}
+
 func main() {
+	shutdown := initTracer()
+	defer shutdown()
+
 	logger := log.New(os.Stdout, "[BOOKING-AGENT] ", log.LstdFlags|log.Lmsgprefix)
 
 	natsURL := os.Getenv("NATS_URL")
@@ -88,19 +124,29 @@ func main() {
 	store := NewBookingStore()
 
 	sub, err := nc.Subscribe("parking.book", func(msg *nats.Msg) {
-		logger.Printf("Получено: %s", string(msg.Data))
+		ctx := context.Background()
 
 		var envelope TaskEnvelope
 		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
-			logger.Printf("Ошибка парсинга конверта: %v", err)
+			logger.Printf("Ошибка парсинга: %v", err)
 			return
 		}
 
 		var req BookingRequest
 		if err := json.Unmarshal([]byte(envelope.Payload), &req); err != nil {
-			logger.Printf("Ошибка парсинга payload: %v", err)
+			logger.Printf("Ошибка payload: %v", err)
 			return
 		}
+
+		ctx, span := tracer.Start(ctx, "booking.process",
+			trace.WithAttributes(
+				attribute.String("task.id", envelope.ID),
+				attribute.String("place_id", req.PlaceID),
+				attribute.String("car_number", req.CarNumber),
+				attribute.Int("hours", req.Hours),
+			),
+		)
+		defer span.End()
 
 		bookingID, success := store.Book(req.PlaceID, req.CarNumber, req.Hours)
 
@@ -111,13 +157,14 @@ func main() {
 				Success:   true,
 				Message:   "Место забронировано",
 			}
-			logger.Printf("Бронирование успешно: %s", bookingID)
+			logger.Printf("Успешно: %s", bookingID)
+			span.SetAttributes(attribute.String("booking_id", bookingID))
 		} else {
 			result = BookingResult{
 				Success: false,
 				Message: "Место уже занято",
 			}
-			logger.Printf("Бронирование отклонено: место %s занято", req.PlaceID)
+			logger.Printf("Отказ: место %s занято", req.PlaceID)
 		}
 
 		event := CompletedEvent{
@@ -128,14 +175,13 @@ func main() {
 		}
 		payload, _ := json.Marshal(event)
 		nc.Publish("tasks.completed", payload)
-		logger.Printf("Ответ отправлен (task_id=%s)", envelope.ID)
 	})
 	if err != nil {
 		logger.Fatalf("Ошибка подписки: %v", err)
 	}
 	defer sub.Unsubscribe()
 
-	logger.Println("Агент бронирования запущен")
+	logger.Println("Агент бронирования запущен (с трассировкой)")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
