@@ -30,10 +30,8 @@ services:
       - NATS_URL=nats://nats:4222
       - REDIS_URL=redis://redis:6379
     depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - nats
+      - redis
     restart: unless-stopped
     deploy:
       replicas: 2
@@ -45,10 +43,8 @@ services:
       - NATS_URL=nats://nats:4222
       - REDIS_URL=redis:6379
     depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - nats
+      - redis
     restart: unless-stopped
 
   agent-access:
@@ -58,10 +54,8 @@ services:
       - NATS_URL=nats://nats:4222
       - REDIS_URL=redis://redis:6379
     depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - nats
+      - redis
     restart: unless-stopped
 
   agent-payment:
@@ -71,10 +65,8 @@ services:
       - NATS_URL=nats://nats:4222
       - REDIS_URL=redis://redis:6379
     depends_on:
-      nats:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+         - nats
+         - redis
     restart: unless-stopped
 
   jaeger:
@@ -85,4 +77,25 @@ services:
       - "4318:4318"     # OTLP HTTP
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+    restart: unless-stopped
+
+  scaler:
+    build: ./scaler
+    depends_on:
+      - nats
+    environment:
+      - DOCKER_HOST=tcp://docker-socket-proxy:2375
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy
+    environment:
+      - CONTAINERS=1
+      - SERVICES=1
+      - TASKS=1
+      - POST=1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
