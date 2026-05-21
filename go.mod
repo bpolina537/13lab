@@ -5,6 +5,7 @@ go 1.21
 require (
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.35.0
+	github.com/redis/go-redis/v9 v9.6.1
 	go.opentelemetry.io/otel v1.21.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.21.0
 	go.opentelemetry.io/otel/sdk v1.21.0
@@ -13,6 +14,8 @@ require (
 
 require (
 	github.com/cenkalti/backoff/v4 v4.2.1 // indirect
+	github.com/cespare/xxhash/v2 v2.2.0 // indirect
+	github.com/dgryski/go-rendezvous v0.0.0-20200823014737-9f7001d12a5f // indirect
 	github.com/go-logr/logr v1.3.0 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/golang/protobuf v1.5.3 // indirect
@@ -31,4 +34,13 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20240102182953-50ed04b92917 // indirect
 	google.golang.org/grpc v1.60.1 // indirect
 	google.golang.org/protobuf v1.32.0 // indirect
+)
+
+// Заменяем проблемные зависимости на старые версии
+replace (
+	github.com/cenkalti/backoff/v5 => github.com/cenkalti/backoff/v4 v4.2.1
+	go.opentelemetry.io/otel => go.opentelemetry.io/otel v1.21.0
+	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc => go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.21.0
+	go.opentelemetry.io/otel/sdk => go.opentelemetry.io/otel/sdk v1.21.0
+	go.opentelemetry.io/otel/trace => go.opentelemetry.io/otel/trace v1.21.0
 )

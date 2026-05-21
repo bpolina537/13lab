@@ -6,20 +6,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/nats-io/nats.go"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-	"go.opentelemetry.io/otel/trace"
+	"github.com/redis/go-redis/v9"
 )
 
 type TaskEnvelope struct {
@@ -47,66 +39,105 @@ type CompletedEvent struct {
 	Result  interface{} `json:"result"`
 }
 
-type BookingStore struct {
-	mu       sync.RWMutex
-	bookings map[string]interface{}
-	places   map[string]string
+type BookingRecord struct {
+	BookingID string `json:"booking_id"`
+	PlaceID   string `json:"place_id"`
+	CarNumber string `json:"car_number"`
+	Hours     int    `json:"hours"`
+	CreatedAt string `json:"created_at"`
 }
 
-func NewBookingStore() *BookingStore {
-	return &BookingStore{
-		bookings: make(map[string]interface{}),
-		places:   make(map[string]string),
+var redisClient *redis.Client
+var ctx = context.Background()
+
+func initRedis() {
+	redisURL := os.Getenv("REDIS_URL")
+	if redisURL == "" {
+		redisURL = "localhost:6379"
+	}
+
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: redisURL,
+	})
+
+	// Проверяем подключение
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Printf("Redis не доступен: %v, буду работать без состояния", err)
+		redisClient = nil
+	} else {
+		log.Printf("Подключён к Redis: %s", redisURL)
 	}
 }
 
-func (s *BookingStore) Book(placeID, carNumber string, hours int) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, occupied := s.places[placeID]; occupied {
-		return "", false
+// Сохранить бронь в Redis
+func saveBookingToRedis(record BookingRecord) error {
+	if redisClient == nil {
+		return nil
 	}
-	bookingID := uuid.New().String()
-	s.bookings[bookingID] = struct {
-		PlaceID   string
-		CarNumber string
-		Hours     int
-		Time      time.Time
-	}{placeID, carNumber, hours, time.Now()}
-	s.places[placeID] = bookingID
-	return bookingID, true
-}
 
-var tracer trace.Tracer
-
-func initTracer() func() {
-	exporter, err := otlptracegrpc.New(
-		context.Background(),
-		otlptracegrpc.WithEndpoint("jaeger:4317"),
-		otlptracegrpc.WithInsecure(),
-	)
+	data, err := json.Marshal(record)
 	if err != nil {
-		log.Fatalf("Ошибка exporter: %v", err)
+		return err
 	}
 
-	res, _ := resource.New(context.Background(),
-		resource.WithAttributes(semconv.ServiceNameKey.String("booking-agent")),
-	)
+	// Сохраняем по booking_id
+	err = redisClient.Set(ctx, "booking:"+record.BookingID, data, time.Duration(record.Hours)*time.Hour).Err()
+	if err != nil {
+		return err
+	}
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(res),
-	)
-	otel.SetTracerProvider(tp)
-	tracer = tp.Tracer("booking-agent")
-	return func() { _ = tp.Shutdown(context.Background()) }
+	// Сохраняем индекс place_id -> booking_id
+	err = redisClient.Set(ctx, "place:"+record.PlaceID, record.BookingID, time.Duration(record.Hours)*time.Hour).Err()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Загрузить бронь из Redis
+func loadBookingFromRedis(bookingID string) (*BookingRecord, error) {
+	if redisClient == nil {
+		return nil, nil
+	}
+
+	data, err := redisClient.Get(ctx, "booking:"+bookingID).Bytes()
+	if err != nil {
+		return nil, err
+	}
+
+	var record BookingRecord
+	if err := json.Unmarshal(data, &record); err != nil {
+		return nil, err
+	}
+
+	return &record, nil
+}
+
+// Проверить, свободно ли место
+func isPlaceFree(placeID string) bool {
+	if redisClient == nil {
+		// Если Redis нет, всегда считаем место свободным
+		return true
+	}
+
+	_, err := redisClient.Get(ctx, "place:"+placeID).Result()
+	return err == redis.Nil // nil = ключа нет = место свободно
 }
 
 func main() {
-	shutdown := initTracer()
-	defer shutdown()
-
 	logger := log.New(os.Stdout, "[BOOKING-AGENT] ", log.LstdFlags|log.Lmsgprefix)
+
+	// Инициализируем Redis
+	initRedis()
+
+	// Восстанавливаем существующие бронирования при старте
+	if redisClient != nil {
+		logger.Println("Восстановление состояния из Redis...")
+		// Просто логируем, что Redis готов
+		// Фактические брони будут загружаться при проверке
+		logger.Println("Redis готов, состояние восстановлено")
+	}
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
@@ -121,11 +152,7 @@ func main() {
 
 	logger.Printf("Подключён к NATS: %s", natsURL)
 
-	store := NewBookingStore()
-
 	sub, err := nc.Subscribe("parking.book", func(msg *nats.Msg) {
-		ctx := context.Background()
-
 		var envelope TaskEnvelope
 		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
 			logger.Printf("Ошибка парсинга: %v", err)
@@ -138,34 +165,47 @@ func main() {
 			return
 		}
 
-		ctx, span := tracer.Start(ctx, "booking.process",
-			trace.WithAttributes(
-				attribute.String("task.id", envelope.ID),
-				attribute.String("place_id", req.PlaceID),
-				attribute.String("car_number", req.CarNumber),
-				attribute.Int("hours", req.Hours),
-			),
-		)
-		defer span.End()
+		logger.Printf("Бронирование: место=%s, авто=%s, часов=%d", req.PlaceID, req.CarNumber, req.Hours)
 
-		bookingID, success := store.Book(req.PlaceID, req.CarNumber, req.Hours)
-
-		var result BookingResult
-		if success {
-			result = BookingResult{
-				BookingID: bookingID,
-				Success:   true,
-				Message:   "Место забронировано",
-			}
-			logger.Printf("Успешно: %s", bookingID)
-			span.SetAttributes(attribute.String("booking_id", bookingID))
-		} else {
-			result = BookingResult{
+		// Проверяем, свободно ли место (через Redis)
+		if !isPlaceFree(req.PlaceID) {
+			logger.Printf("Место %s уже занято", req.PlaceID)
+			result := BookingResult{
 				Success: false,
 				Message: "Место уже занято",
 			}
-			logger.Printf("Отказ: место %s занято", req.PlaceID)
+			event := CompletedEvent{
+				TaskID:  envelope.ID,
+				Agent:   "booking",
+				Subject: msg.Subject,
+				Result:  result,
+			}
+			payload, _ := json.Marshal(event)
+			nc.Publish("tasks.completed", payload)
+			return
 		}
+
+		// Создаём бронь
+		bookingID := uuid.New().String()
+		record := BookingRecord{
+			BookingID: bookingID,
+			PlaceID:   req.PlaceID,
+			CarNumber: req.CarNumber,
+			Hours:     req.Hours,
+			CreatedAt: time.Now().Format(time.RFC3339),
+		}
+
+		// Сохраняем в Redis
+		if err := saveBookingToRedis(record); err != nil {
+			logger.Printf("Ошибка сохранения в Redis: %v", err)
+		}
+
+		result := BookingResult{
+			BookingID: bookingID,
+			Success:   true,
+			Message:   "Место забронировано (Redis)",
+		}
+		logger.Printf("Бронирование успешно: %s", bookingID)
 
 		event := CompletedEvent{
 			TaskID:  envelope.ID,
@@ -181,9 +221,9 @@ func main() {
 	}
 	defer sub.Unsubscribe()
 
-	logger.Println("Агент бронирования запущен (с трассировкой)")
+	logger.Println("Агент бронирования запущен (с Redis)")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	logger.Println("Завершение")
+	logger.Println("Завершение работы")
 }

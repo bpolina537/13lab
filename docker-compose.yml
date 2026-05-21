@@ -43,7 +43,7 @@ services:
     command: ["go", "run", "./agents/booking"]
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_URL=redis://redis:6379
+      - REDIS_URL=redis:6379
     depends_on:
       nats:
         condition: service_healthy
