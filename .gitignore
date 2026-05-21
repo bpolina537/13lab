@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work
+go.work.sum
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docker / logs
+*.log
+orchestrator.log
+traces/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# NATS / temp
+*.tmp
+temp/
+
+# OS
+Thumbs.db
+desktop.ini
