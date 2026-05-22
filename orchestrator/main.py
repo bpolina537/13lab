@@ -9,21 +9,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
 
-# OpenTelemetry
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider
-from opentelemetry.sdk.trace.export import BatchSpanProcessor
-from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-
-# Настройка трассировки
-provider = TracerProvider()
-processor = BatchSpanProcessor(OTLPSpanExporter(endpoint="http://localhost:4317", insecure=True))
-provider.add_span_processor(processor)
-trace.set_tracer_provider(provider)
-
-tracer = trace.get_tracer(__name__)
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -37,10 +22,21 @@ class PipelineOrchestrator:
         self.nc = await nats.connect("nats://localhost:4222")
         logger.info("Оркестратор подключён к NATS")
         await self.nc.subscribe("tasks.completed", cb=self._on_result)
-        logger.info("Подписка на tasks.completed")
+        await self.nc.subscribe("llm.result", cb=self._on_result)
+        logger.info("Подписка на tasks.completed и llm.result")
 
     async def _on_result(self, msg):
         data = json.loads(msg.data.decode())
+        logger.info(f"Получен ответ: {data}")
+
+        # Для LLM-агента
+        if "task_id" in data and "result" in data:
+            task_id = data["task_id"]
+            if task_id in self.results:
+                self.results[task_id].set_result(data)
+                return
+
+        # Для обычных агентов
         task_id = data.get("task_id") or data.get("id")
         if not task_id and "result" in data:
             task_id = data["result"].get("task_id")
@@ -58,19 +54,13 @@ class PipelineOrchestrator:
             self.results[task_id] = future
 
             try:
-                # Создаём span для этого шага
-                with tracer.start_as_current_span(f"send_{subject}") as span:
-                    span.set_attribute("task_id", task_id)
-                    span.set_attribute("subject", subject)
-                    span.set_attribute("attempt", attempt + 1)
+                logger.info(f"Отправка {subject} (попытка {attempt + 1})")
+                await self.nc.publish(subject, json.dumps(task).encode())
+                result = await asyncio.wait_for(future, timeout=timeout)
 
-                    logger.info(f"Отправка {subject} (попытка {attempt + 1})")
-                    await self.nc.publish(subject, json.dumps(task).encode())
-                    result = await asyncio.wait_for(future, timeout=timeout)
-
-                    if result.get("result", {}).get("success") is False:
-                        raise Exception(result.get("result", {}).get("message", "Ошибка"))
-                    return result
+                if result.get("result", {}).get("success") is False:
+                    raise Exception(result.get("result", {}).get("message", "Ошибка"))
+                return result
             except asyncio.TimeoutError:
                 logger.warning(f"Таймаут {subject}")
                 if attempt == max_retries - 1:
@@ -83,49 +73,12 @@ class PipelineOrchestrator:
             finally:
                 self.results.pop(task_id, None)
 
-    async def run_pipeline(self, zone: str, car_number: str, hours: int) -> dict:
-        # Корневой span для всего pipeline
-        with tracer.start_as_current_span("pipeline") as parent_span:
-            parent_span.set_attribute("zone", zone)
-            parent_span.set_attribute("car_number", car_number)
-            parent_span.set_attribute("hours", hours)
-
-            try:
-                logger.info(f"Поиск в зоне {zone}")
-                search_result = await self.send_task_auction("parking.search", {"zone": zone})
-                places = search_result.get("result", {}).get("places", [])
-                if not places:
-                    raise Exception("Нет мест")
-                place_id = places[0]
-
-                logger.info(f"Бронирование {place_id}")
-                book_result = await self.send_task("parking.book",
-                                                   {"place_id": place_id, "car_number": car_number, "hours": hours})
-                booking_id = book_result.get("result", {}).get("booking_id")
-                if not booking_id:
-                    raise Exception("Нет booking_id")
-
-                logger.info(f"Въезд {car_number}")
-                await self.send_task("parking.access",
-                                     {"booking_id": booking_id, "car_number": car_number, "action": "enter"})
-
-                logger.info(f"Оплата {hours} ч")
-                payment_result = await self.send_task("parking.payment", {"booking_id": booking_id, "hours": hours})
-                amount = payment_result.get("result", {}).get("amount", 0)
-
-                return {"status": "success", "place_id": place_id, "booking_id": booking_id, "amount": amount,
-                        "currency": "RUB"}
-            except Exception as e:
-                logger.error(f"Ошибка: {e}")
-                return {"status": "failed", "error": str(e)}
-
     async def send_task_auction(self, subject: str, payload: dict, timeout: int = 10) -> dict:
         """Отправляет задачу через аукцион, выбирает лучшего агента"""
         task_id = str(uuid.uuid4())
         task = {"id": task_id, "type": subject, "payload": json.dumps(payload)}
 
         bids = {}
-        bid_future = asyncio.Future()
 
         async def on_bid(msg):
             data = json.loads(msg.data.decode())
@@ -135,7 +88,7 @@ class PipelineOrchestrator:
                     "agent_zone": data.get("agent_zone", "?"),
                     "load": data.get("load", 0)
                 }
-                logger.info(f"Ставка: агент={data['agent_id']}, цена={data['bid']}, нагрузка={data.get('load', 0)}")
+                logger.info(f"Ставка: агент={data['agent_id']}, цена={data['bid']}")
 
         # Подписываемся на ставки
         await self.nc.subscribe("auction.search.bid", cb=on_bid)
@@ -157,8 +110,7 @@ class PipelineOrchestrator:
         winner_id = min(bids.items(), key=lambda x: x[1]["bid"])[0]
         winner = bids[winner_id]
 
-        logger.info(
-            f"🏆 Победитель: {winner_id} (цена={winner['bid']}, зона={winner['agent_zone']}, нагрузка={winner['load']})")
+        logger.info(f"🏆 Победитель: {winner_id} (цена={winner['bid']})")
 
         # Отправляем задачу победителю
         await self.nc.publish("auction.search.winner", json.dumps({
@@ -172,18 +124,68 @@ class PipelineOrchestrator:
         self.results[task_id] = future
         return await asyncio.wait_for(future, timeout=timeout)
 
+    async def run_pipeline(self, zone: str, car_number: str, hours: int, use_auction: bool = True) -> dict:
+        """Запускает полный pipeline: поиск → бронь → доступ → оплата"""
+        try:
+            # Шаг 1: Поиск (с аукционом или без)
+            if use_auction:
+                logger.info(f"Поиск в зоне {zone} (аукцион)")
+                search_result = await self.send_task_auction("parking.search", {"zone": zone})
+            else:
+                logger.info(f"Поиск в зоне {zone}")
+                search_result = await self.send_task("parking.search", {"zone": zone})
+
+            places = search_result.get("result", {}).get("places", [])
+            if not places:
+                raise Exception("Нет свободных мест")
+            place_id = places[0]
+
+            # Шаг 2: Бронирование
+            logger.info(f"Бронирование {place_id}")
+            book_result = await self.send_task("parking.book", {
+                "place_id": place_id, "car_number": car_number, "hours": hours
+            })
+            booking_id = book_result.get("result", {}).get("booking_id")
+            if not booking_id:
+                raise Exception("Не удалось получить booking_id")
+
+            # Шаг 3: Въезд
+            logger.info(f"Въезд {car_number}")
+            await self.send_task("parking.access", {
+                "booking_id": booking_id, "car_number": car_number, "action": "enter"
+            })
+
+            # Шаг 4: Оплата
+            logger.info(f"Оплата {hours} часов")
+            payment_result = await self.send_task("parking.payment", {
+                "booking_id": booking_id, "hours": hours
+            })
+            amount = payment_result.get("result", {}).get("amount", 0)
+
+            return {
+                "status": "success",
+                "place_id": place_id,
+                "booking_id": booking_id,
+                "amount": amount,
+                "currency": "RUB"
+            }
+        except Exception as e:
+            logger.error(f"Pipeline ошибка: {e}")
+            return {"status": "failed", "error": str(e)}
+
 
 app = FastAPI(title="Parking System API")
 orchestrator = PipelineOrchestrator()
-
-# Автоматическая трассировка всех эндпоинтов FastAPI
-FastAPIInstrumentor.instrument_app(app)
 
 
 class PipelineRequest(BaseModel):
     zone: str
     car_number: str
     hours: int
+
+
+class LLMPipelineRequest(BaseModel):
+    text: str
 
 
 @app.on_event("startup")
@@ -193,19 +195,71 @@ async def startup():
 
 @app.post("/pipeline")
 async def run_pipeline(request: PipelineRequest):
-    with tracer.start_as_current_span("http_pipeline") as span:
-        span.set_attribute("http.method", "POST")
-        span.set_attribute("http.route", "/pipeline")
-        result = await orchestrator.run_pipeline(request.zone, request.car_number, request.hours)
-        if result["status"] == "failed":
-            raise HTTPException(400, result["error"])
-        return result
+    result = await orchestrator.run_pipeline(
+        zone=request.zone,
+        car_number=request.car_number,
+        hours=request.hours,
+        use_auction=True
+    )
+    if result["status"] == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.post("/pipeline/no_auction")
+async def run_pipeline_no_auction(request: PipelineRequest):
+    result = await orchestrator.run_pipeline(
+        zone=request.zone,
+        car_number=request.car_number,
+        hours=request.hours,
+        use_auction=False
+    )
+    if result["status"] == "failed":
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return result
+
+
+@app.post("/llm_pipeline")
+async def llm_pipeline(request: LLMPipelineRequest):
+    """Принимает текст, отправляет в LLM, затем запускает pipeline"""
+    task_id = str(uuid.uuid4())
+
+    logger.info(f"LLM запрос: {request.text}")
+
+    # Отправляем запрос в LLM-агента
+    future = asyncio.Future()
+    orchestrator.results[task_id] = future
+
+    await orchestrator.nc.publish("llm.parse", json.dumps({
+        "task_id": task_id,
+        "text": request.text
+    }).encode())
+
+    try:
+        result = await asyncio.wait_for(future, timeout=15)
+        params = result.get("result", {})
+
+        zone = params.get("zone", "A")
+        hours = params.get("hours", 2)
+
+        logger.info(f"LLM распознал: зона={zone}, часов={hours}")
+
+        # Запускаем pipeline с полученными параметрами
+        pipeline_result = await orchestrator.run_pipeline(
+            zone=zone,
+            car_number="LLM_AUTO",
+            hours=hours,
+            use_auction=True
+        )
+        return pipeline_result
+    except asyncio.TimeoutError:
+        logger.error("LLM агент не ответил")
+        raise HTTPException(status_code=400, detail="LLM агент не ответил")
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
-
 
 
 if __name__ == "__main__":
