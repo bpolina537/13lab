@@ -261,6 +261,18 @@ async def llm_pipeline(request: LLMPipelineRequest):
 async def health():
     return {"status": "ok"}
 
+@app.get("/agent_status")
+async def agent_status():
+    """Возвращает статус агентов (упрощённо)"""
+    return {
+        "agents": [
+            {"name": "search", "status": "running", "replicas": 3},
+            {"name": "booking", "status": "running", "replicas": 1},
+            {"name": "access", "status": "running", "replicas": 1},
+            {"name": "payment", "status": "running", "replicas": 1},
+            {"name": "llm", "status": "running", "replicas": 1}
+        ]
+    }
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
