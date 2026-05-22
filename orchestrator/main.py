@@ -92,7 +92,7 @@ class PipelineOrchestrator:
 
             try:
                 logger.info(f"Поиск в зоне {zone}")
-                search_result = await self.send_task("parking.search", {"zone": zone})
+                search_result = await self.send_task_auction("parking.search", {"zone": zone})
                 places = search_result.get("result", {}).get("places", [])
                 if not places:
                     raise Exception("Нет мест")
@@ -118,6 +118,59 @@ class PipelineOrchestrator:
             except Exception as e:
                 logger.error(f"Ошибка: {e}")
                 return {"status": "failed", "error": str(e)}
+
+    async def send_task_auction(self, subject: str, payload: dict, timeout: int = 10) -> dict:
+        """Отправляет задачу через аукцион, выбирает лучшего агента"""
+        task_id = str(uuid.uuid4())
+        task = {"id": task_id, "type": subject, "payload": json.dumps(payload)}
+
+        bids = {}
+        bid_future = asyncio.Future()
+
+        async def on_bid(msg):
+            data = json.loads(msg.data.decode())
+            if data.get("task_id") == task_id:
+                bids[data["agent_id"]] = {
+                    "bid": data["bid"],
+                    "agent_zone": data.get("agent_zone", "?"),
+                    "load": data.get("load", 0)
+                }
+                logger.info(f"Ставка: агент={data['agent_id']}, цена={data['bid']}, нагрузка={data.get('load', 0)}")
+
+        # Подписываемся на ставки
+        await self.nc.subscribe("auction.search.bid", cb=on_bid)
+
+        # Отправляем запрос на аукцион
+        logger.info(f"📢 Аукцион для {subject}, task_id={task_id}")
+        await self.nc.publish("auction.search.request", json.dumps({
+            "task_id": task_id,
+            "task": task
+        }).encode())
+
+        # Ждём ставки 3 секунды
+        await asyncio.sleep(3)
+
+        if not bids:
+            raise Exception("Нет ставок на аукционе")
+
+        # Выбираем победителя с минимальной ценой
+        winner_id = min(bids.items(), key=lambda x: x[1]["bid"])[0]
+        winner = bids[winner_id]
+
+        logger.info(
+            f"🏆 Победитель: {winner_id} (цена={winner['bid']}, зона={winner['agent_zone']}, нагрузка={winner['load']})")
+
+        # Отправляем задачу победителю
+        await self.nc.publish("auction.search.winner", json.dumps({
+            "task_id": task_id,
+            "agent_id": winner_id,
+            "task": task
+        }).encode())
+
+        # Ждём результат
+        future = asyncio.Future()
+        self.results[task_id] = future
+        return await asyncio.wait_for(future, timeout=timeout)
 
 
 app = FastAPI(title="Parking System API")
@@ -152,6 +205,7 @@ async def run_pipeline(request: PipelineRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 
 if __name__ == "__main__":

@@ -1,22 +1,16 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/nats-io/nats.go"
-
-	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/sdk/resource"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
-	"go.opentelemetry.io/otel/trace"
 )
 
 type TaskEnvelope struct {
@@ -41,41 +35,77 @@ type CompletedEvent struct {
 	Result  interface{} `json:"result"`
 }
 
+type AuctionRequest struct {
+	TaskID string       `json:"task_id"`
+	Task   TaskEnvelope `json:"task"`
+}
+
+type AuctionBid struct {
+	TaskID    string `json:"task_id"`
+	AgentID   string `json:"agent_id"`
+	AgentZone string `json:"agent_zone"`
+	Bid       int    `json:"bid"`
+	Load      int    `json:"load"`
+}
+
+type AuctionWinner struct {
+	TaskID   string       `json:"task_id"`
+	AgentID  string       `json:"agent_id"`
+	Task     TaskEnvelope `json:"task"`
+}
+
 var zoneMap = map[string][]string{
 	"A": {"A1", "A2", "A3"},
 	"B": {"B1", "B2"},
 	"C": {"C1", "C2", "C3", "C4"},
 }
 
-var tracer trace.Tracer
+var agentID string
+var agentZone string
+var taskCount int32
 
-func initTracer() func() {
-	exporter, _ := otlptracegrpc.New(
-		context.Background(),
-		otlptracegrpc.WithEndpoint("jaeger:4317"),
-		otlptracegrpc.WithInsecure(),
-	)
+func calculateBid(zone string) int {
+	// Базовая цена
+	basePrice := 10
 
-	res, _ := resource.New(context.Background(),
-		resource.WithAttributes(
-			semconv.ServiceNameKey.String("search-agent"),
-		),
-	)
+	// Загруженность (чем больше задач, тем дороже)
+	load := atomic.LoadInt32(&taskCount)
+	loadCost := int(load) * 5
 
-	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithResource(res),
-	)
-	otel.SetTracerProvider(tp)
-	tracer = tp.Tracer("search-agent")
-	return func() { _ = tp.Shutdown(context.Background()) }
+	// Специализация: если зона агента совпадает с запрошенной — скидка
+	skillMatch := 0
+	if agentZone == zone {
+		skillMatch = 10
+	}
+
+	// Доступность: если занят > 3 задач — штраф
+	availabilityPenalty := 0
+	if load > 3 {
+		availabilityPenalty = 20
+	}
+
+	// Итоговая цена
+	price := basePrice + loadCost - skillMatch + availabilityPenalty
+	if price < 0 {
+		price = 0
+	}
+
+	return price
 }
 
 func main() {
-	shutdown := initTracer()
-	defer shutdown()
-
 	logger := log.New(os.Stdout, "[SEARCH-AGENT] ", log.LstdFlags|log.Lmsgprefix)
+
+	// Генерируем уникальный ID и зону агента
+	agentID = os.Getenv("HOSTNAME")
+	if agentID == "" {
+		agentID = "search-" + time.Now().Format("150405")
+	}
+
+	// Агент получает случайную специализацию (зона A, B или C)
+	zones := []string{"A", "B", "C"}
+	agentZone = zones[rand.Intn(3)]
+	logger.Printf("Agent ID: %s, специализация: зона %s", agentID, agentZone)
 
 	natsURL := os.Getenv("NATS_URL")
 	if natsURL == "" {
@@ -88,29 +118,64 @@ func main() {
 	}
 	defer nc.Drain()
 
-	logger.Printf("Подключён к NATS: %s", natsURL)
+	// Подписка на аукционные запросы
+	auctionSub, _ := nc.Subscribe("auction.search.request", func(msg *nats.Msg) {
+		var req AuctionRequest
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			logger.Printf("Ошибка парсинга аукциона: %v", err)
+			return
+		}
 
-	sub, err := nc.Subscribe("parking.search", func(msg *nats.Msg) {
-		// Извлекаем trace context из NATS заголовков (если есть)
-		ctx := context.Background()
+		// Парсим payload для получения зоны
+		var searchReq SearchRequest
+		if err := json.Unmarshal([]byte(req.Task.Payload), &searchReq); err != nil {
+			logger.Printf("Ошибка payload: %v", err)
+			return
+		}
 
-		var envelope TaskEnvelope
-		if err := json.Unmarshal(msg.Data, &envelope); err != nil {
+		// Вычисляем цену
+		price := calculateBid(searchReq.Zone)
+
+		logger.Printf("Аукцион task=%s, зона=%s, цена=%d (нагрузка=%d)",
+			req.TaskID, searchReq.Zone, price, taskCount)
+
+		bid := AuctionBid{
+			TaskID:    req.TaskID,
+			AgentID:   agentID,
+			AgentZone: agentZone,
+			Bid:       price,
+			Load:      int(taskCount),
+		}
+		payload, _ := json.Marshal(bid)
+		nc.Publish("auction.search.bid", payload)
+	})
+
+	// Подписка на победителя аукциона
+	winnerSub, _ := nc.Subscribe("auction.search.winner", func(msg *nats.Msg) {
+		var winner AuctionWinner
+		if err := json.Unmarshal(msg.Data, &winner); err != nil {
 			logger.Printf("Ошибка: %v", err)
 			return
 		}
 
+		if winner.AgentID != agentID {
+			return
+		}
+
+		// Увеличиваем счётчик задач
+		atomic.AddInt32(&taskCount, 1)
+		defer atomic.AddInt32(&taskCount, -1)
+
+		logger.Printf("🏆 Победил в аукционе! Обрабатываю задачу %s", winner.TaskID)
+
+		// Обработка задачи
 		var req SearchRequest
-		if err := json.Unmarshal([]byte(envelope.Payload), &req); err != nil {
-			logger.Printf("Ошибка: %v", err)
+		if err := json.Unmarshal([]byte(winner.Task.Payload), &req); err != nil {
+			logger.Printf("Ошибка payload: %v", err)
 			return
 		}
 
-		// Создаём span для обработки
-		ctx, span := tracer.Start(ctx, "search.handle",
-			trace.WithAttributes(attribute.String("zone", req.Zone)),
-		)
-		defer span.End()
+		time.Sleep(100 * time.Millisecond) // симуляция работы
 
 		places, ok := zoneMap[req.Zone]
 		if !ok {
@@ -118,24 +183,21 @@ func main() {
 		}
 
 		result := SearchResult{Zone: req.Zone, Places: places}
-		logger.Printf("Найдено: %v", places)
-
 		event := CompletedEvent{
-			TaskID:  envelope.ID,
+			TaskID:  winner.TaskID,
 			Agent:   "search",
-			Subject: msg.Subject,
+			Subject: winner.Task.Type,
 			Result:  result,
 		}
 		payload, _ := json.Marshal(event)
 		nc.Publish("tasks.completed", payload)
-		span.SetAttributes(attribute.Int("places_count", len(places)))
+		logger.Printf("✅ Результат отправлен, мест: %d", len(places))
 	})
-	if err != nil {
-		logger.Fatalf("Ошибка подписки: %v", err)
-	}
-	defer sub.Unsubscribe()
 
-	logger.Println("Агент поиска запущен")
+	defer auctionSub.Unsubscribe()
+	defer winnerSub.Unsubscribe()
+
+	logger.Println("Агент поиска запущен (с аукционом)")
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
